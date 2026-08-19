@@ -7,17 +7,49 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, ClassVar, Protocol, Sequence
 
 
 BASE_DIR = Path(__file__).resolve().parent
 RESULTS_DIR = BASE_DIR / "results"
 KAKAO_KEYWORD_SEARCH_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
 DEFAULT_OPENAI_MODEL = "gpt-5.6-luna"
+DEFAULT_PLACE_SEARCH_PROVIDER = "kakao"
 CACHE_SCHEMA_VERSION = 2
+
+STANDARD_CITY_NAMES = {
+    "서울특별시": "서울",
+    "서울시": "서울",
+    "부산광역시": "부산",
+    "대구광역시": "대구",
+    "인천광역시": "인천",
+    "광주광역시": "광주",
+    "대전광역시": "대전",
+    "울산광역시": "울산",
+    "세종특별자치시": "세종",
+    "경기도": "경기",
+    "강원특별자치도": "강원",
+    "강원도": "강원",
+    "충청북도": "충북",
+    "충청남도": "충남",
+    "전북특별자치도": "전북",
+    "전라북도": "전북",
+    "전라남도": "전남",
+    "경상북도": "경북",
+    "경상남도": "경남",
+    "제주특별자치도": "제주",
+    "제주도": "제주",
+}
+ADMINISTRATIVE_SUFFIX_PATTERN = re.compile(
+    r"(?:특별자치시|특별자치도|특별시|광역시|자치시|자치도|시|군|구|읍|면|동)$"
+)
+LOCATION_SEPARATOR_PATTERN = re.compile(r"[,/·>|()\[\]{}]+")
+ADMINISTRATIVE_STOPWORDS = {"도", "시", "군", "구", "읍", "면", "동"}
+MAX_LOCATION_KEYWORDS = 3
 
 CITY_RECOMMENDATION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -86,6 +118,83 @@ class Settings:
     openai_api_key: str
     kakao_rest_api_key: str
     openai_model: str
+    place_search_provider: str = DEFAULT_PLACE_SEARCH_PROVIDER
+
+
+class RestaurantSearchProvider(Protocol):
+    """지도 검색 플러그인이 구현해야 하는 최소 인터페이스."""
+
+    provider_name: str
+
+    def search_restaurants(
+        self, city: str, *, size: int = 5
+    ) -> list[dict[str, Any]]:
+        """정규화된 도시명으로 식당을 검색해 공통 장소 목록을 반환한다."""
+
+
+PlaceSearchProviderFactory = Callable[[Settings], RestaurantSearchProvider]
+PLACE_SEARCH_PROVIDER_FACTORIES: dict[str, PlaceSearchProviderFactory] = {}
+
+
+def register_place_search_provider(
+    name: str,
+    factory: PlaceSearchProviderFactory,
+    *,
+    replace: bool = False,
+) -> None:
+    """장소 검색 플러그인 팩토리를 이름으로 등록한다."""
+    normalized_name = name.strip().lower()
+    if not normalized_name:
+        raise ValueError("장소 검색 플러그인 이름은 비어 있을 수 없습니다.")
+    if not callable(factory):
+        raise TypeError("장소 검색 플러그인 factory는 호출 가능해야 합니다.")
+    if normalized_name in PLACE_SEARCH_PROVIDER_FACTORIES and not replace:
+        raise ValueError(f"이미 등록된 장소 검색 플러그인입니다: {normalized_name}")
+    PLACE_SEARCH_PROVIDER_FACTORIES[normalized_name] = factory
+
+
+def create_place_search_provider(settings: Settings) -> RestaurantSearchProvider:
+    """설정에 선택된 장소 검색 플러그인 인스턴스를 만든다."""
+    provider_name = settings.place_search_provider.strip().lower()
+    factory = PLACE_SEARCH_PROVIDER_FACTORIES.get(provider_name)
+    if factory is None:
+        available = ", ".join(sorted(PLACE_SEARCH_PROVIDER_FACTORIES)) or "없음"
+        raise ConfigurationError(
+            f"등록되지 않은 장소 검색 플러그인입니다: {provider_name}. "
+            f"사용 가능: {available}"
+        )
+    provider = factory(settings)
+    if not callable(getattr(provider, "search_restaurants", None)):
+        raise ConfigurationError(
+            f"{provider_name} 플러그인에 search_restaurants 메서드가 없습니다."
+        )
+    return provider
+
+
+def normalize_city_name(value: str) -> str:
+    """LLM 지명을 지도 검색에 적합한 최대 3개의 핵심 토큰으로 정규화한다."""
+    text = unicodedata.normalize("NFKC", value).strip()
+    text = LOCATION_SEPARATOR_PATTERN.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    if text in STANDARD_CITY_NAMES:
+        return STANDARD_CITY_NAMES[text]
+
+    keywords: list[str] = []
+    for token in text.split():
+        if token in ADMINISTRATIVE_STOPWORDS:
+            continue
+        keyword = STANDARD_CITY_NAMES.get(token)
+        if keyword is None:
+            stripped = ADMINISTRATIVE_SUFFIX_PATTERN.sub("", token).strip()
+            keyword = stripped if len(stripped) >= 2 else token
+            keyword = STANDARD_CITY_NAMES.get(keyword, keyword)
+        if keyword and keyword not in keywords:
+            keywords.append(keyword)
+        if len(keywords) == MAX_LOCATION_KEYWORDS:
+            break
+    return " ".join(keywords)
 
 
 def parse_travel_date(value: str) -> str:
@@ -134,15 +243,13 @@ def load_settings() -> Settings:
     openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
     kakao_rest_api_key = os.getenv("KAKAO_REST_API_KEY", "").strip()
     openai_model = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL).strip()
+    place_search_provider = os.getenv(
+        "PLACE_SEARCH_PROVIDER", DEFAULT_PLACE_SEARCH_PROVIDER
+    ).strip().lower()
 
-    missing = [
-        name
-        for name, value in (
-            ("OPENAI_API_KEY", openai_api_key),
-            ("KAKAO_REST_API_KEY", kakao_rest_api_key),
-        )
-        if not value
-    ]
+    missing = ["OPENAI_API_KEY"] if not openai_api_key else []
+    if place_search_provider == "kakao" and not kakao_rest_api_key:
+        missing.append("KAKAO_REST_API_KEY")
     if missing:
         joined = ", ".join(missing)
         raise ConfigurationError(
@@ -151,8 +258,15 @@ def load_settings() -> Settings:
         )
     if not openai_model:
         raise ConfigurationError("OPENAI_MODEL 값이 비어 있습니다.")
+    if not place_search_provider:
+        raise ConfigurationError("PLACE_SEARCH_PROVIDER 값이 비어 있습니다.")
 
-    return Settings(openai_api_key, kakao_rest_api_key, openai_model)
+    return Settings(
+        openai_api_key,
+        kakao_rest_api_key,
+        openai_model,
+        place_search_provider,
+    )
 
 
 def create_openai_client(api_key: str) -> Any:
@@ -185,6 +299,10 @@ def validate_city_recommendation(payload: Any) -> dict[str, Any]:
         if not payload[key].strip():
             raise ValueError(f"{key} 값이 비어 있습니다.")
 
+    normalized_city = normalize_city_name(payload["city"])
+    if not normalized_city:
+        raise ValueError("city에서 유효한 지역 검색어를 추출하지 못했습니다.")
+
     events = payload["events"]
     if not 1 <= len(events) <= 3:
         raise ValueError("events는 1개 이상 3개 이하이어야 합니다.")
@@ -192,7 +310,7 @@ def validate_city_recommendation(payload: Any) -> dict[str, Any]:
         raise ValueError("events의 모든 항목은 비어 있지 않은 문자열이어야 합니다.")
 
     return {
-        "city": payload["city"].strip(),
+        "city": normalized_city,
         "weather": payload["weather"].strip(),
         "events": [item.strip() for item in events],
         "reason": payload["reason"].strip(),
@@ -293,6 +411,8 @@ def normalize_kakao_place(document: dict[str, Any]) -> dict[str, Any]:
 def search_kakao_restaurants(
     city: str, api_key: str, *, size: int = 5
 ) -> list[dict[str, Any]]:
+    if not 1 <= size <= 15:
+        raise ValueError("Kakao 검색 size는 1 이상 15 이하이어야 합니다.")
     try:
         import requests
     except ModuleNotFoundError as exc:
@@ -300,11 +420,15 @@ def search_kakao_restaurants(
             "requests 패키지가 없습니다. 'pip install -r requirements.txt'를 실행하세요."
         ) from exc
 
+    search_city = normalize_city_name(city)
+    if not search_city:
+        raise ValueError("Kakao 검색에 사용할 도시명이 비어 있습니다.")
+
     response = requests.get(
         KAKAO_KEYWORD_SEARCH_URL,
         headers={"Authorization": f"KakaoAK {api_key}"},
         params={
-            "query": f"{city} 맛집",
+            "query": f"{search_city} 맛집",
             "category_group_code": "FD6",
             "size": size,
             "sort": "accuracy",
@@ -317,6 +441,30 @@ def search_kakao_restaurants(
     if not isinstance(documents, list):
         raise ValueError("Kakao API 응답의 documents가 목록이 아닙니다.")
     return [normalize_kakao_place(item) for item in documents[:size]]
+
+
+@dataclass(frozen=True)
+class KakaoRestaurantSearchProvider:
+    """Kakao Local API를 공통 장소 검색 인터페이스에 맞춘 어댑터."""
+
+    api_key: str
+    provider_name: ClassVar[str] = "kakao"
+
+    def search_restaurants(
+        self, city: str, *, size: int = 5
+    ) -> list[dict[str, Any]]:
+        return search_kakao_restaurants(city, self.api_key, size=size)
+
+
+def _create_kakao_place_search_provider(
+    settings: Settings,
+) -> KakaoRestaurantSearchProvider:
+    if not settings.kakao_rest_api_key:
+        raise ConfigurationError("Kakao 플러그인에는 KAKAO_REST_API_KEY가 필요합니다.")
+    return KakaoRestaurantSearchProvider(settings.kakao_rest_api_key)
+
+
+register_place_search_provider("kakao", _create_kakao_place_search_provider)
 
 
 def make_error(
@@ -603,6 +751,7 @@ def run(
 
     errors: list[dict[str, str]] = []
     client = create_openai_client(settings.openai_api_key)
+    place_search_provider = create_place_search_provider(settings)
 
     print("[1/3] 1차 여행 추천 생성 중(OpenAI)...")
     try:
@@ -630,15 +779,16 @@ def run(
         "  - 추천 지역: "
         + ", ".join(item["city"] for item in recommended_cities)
     )
-    print("[2/3] Kakao Local API로 지역별 맛집 검색 중...")
+    print(
+        f"[2/3] {place_search_provider.provider_name} 장소 검색 플러그인으로 "
+        "지역별 맛집 검색 중..."
+    )
     recommendations: list[dict[str, Any]] = []
     for index, item in enumerate(recommended_cities, start=1):
         city = item["city"]
         print(f"  - [{index}/{len(recommended_cities)}] {city} 검색 중...")
         try:
-            restaurants = search_kakao_restaurants(
-                city, settings.kakao_rest_api_key
-            )
+            restaurants = place_search_provider.search_restaurants(city)
             if not restaurants:
                 errors.append(
                     make_error(
