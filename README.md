@@ -51,19 +51,147 @@ cp .env.example .env
 ```dotenv
 OPENAI_API_KEY=your_openai_api_key
 OPENAI_MODEL=gpt-5.6-luna
+PLACE_SEARCH_PROVIDER=kakao
 KAKAO_REST_API_KEY=your_kakao_rest_api_key
 ```
 
 - OpenAI 모델을 사용할 수 없다는 응답이 오면 계정에서 사용 가능한 Structured
   Outputs 지원 모델로 `OPENAI_MODEL`을 변경합니다.
 - Kakao 키는 JavaScript 키나 Admin 키가 아닌 앱의 **REST API 키**를 사용합니다.
+- `PLACE_SEARCH_PROVIDER`는 등록된 지도 검색 플러그인 이름이며 기본값은
+  `kakao`입니다.
 - `.env`는 `.gitignore`에 포함되어 있으므로 Git에 커밋하지 않습니다.
 - 키를 코드, README, 실행 로그, JSON, Markdown에 복사하지 마세요.
 
 공식 문서:
 
 - [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
+- [OpenAI Responses API - Create a response](https://developers.openai.com/api/reference/resources/responses/methods/create)
 - [Kakao Local API](https://developers.kakao.com/docs/ko/local/dev-guide)
+
+## 외부 API의 GET/POST 사용 설계
+
+프로그램의 외부 통신은 다음 세 호출로 구성됩니다. `OpenAI` 호출은 SDK를
+사용하므로 코드에는 `client.responses.create()`로 보이지만, 실제 HTTP 요청은
+Responses API의 `POST /v1/responses`입니다.
+
+| 호출 단계 | HTTP 메서드와 예시 엔드포인트 | 선택 이유 |
+| --- | --- | --- |
+| 1차 여행지 추천 | `POST https://api.openai.com/v1/responses` | 프롬프트와 JSON Schema를 요청 본문으로 보내고, 모델이 매번 새로운 응답 리소스를 생성하므로 `POST`가 적합합니다. 긴 프롬프트와 인증 정보를 URL 쿼리에 노출하지 않습니다. |
+| 지역별 맛집 검색 | `GET https://dapi.kakao.com/v2/local/search/keyword.json?query=강릉+맛집&category_group_code=FD6&size=5` | 서버 리소스를 만들거나 변경하지 않는 읽기 전용 검색입니다. 같은 조건의 조회는 반복해도 서버 상태를 바꾸지 않으므로 `GET`을 사용하고 검색 조건은 쿼리 파라미터로 전달합니다. |
+| 최종 리포트 생성 | `POST https://api.openai.com/v1/responses` | 지역별 JSON을 본문으로 전달해 새로운 Markdown 응답을 생성하는 작업이므로 `POST`를 사용합니다. |
+
+즉, 기존 장소를 조회하는 Kakao 검색에는 `GET`, 프롬프트를 처리해 새 모델
+응답을 생성하는 OpenAI 호출에는 `POST`를 사용합니다. 현재 프로그램에는 장소나
+여행 리소스를 외부 서버에 생성·수정하는 별도의 `POST`, `PUT`, `DELETE` 호출은
+없습니다.
+
+## 지도 검색 플러그인 설계
+
+### 공통 인터페이스와 입출력 스펙
+
+`run()`은 Kakao 함수를 직접 알지 못하고 `RestaurantSearchProvider` 프로토콜의
+다음 메서드만 호출합니다.
+
+```python
+class RestaurantSearchProvider(Protocol):
+    provider_name: str
+
+    def search_restaurants(
+        self, city: str, *, size: int = 5
+    ) -> list[dict[str, Any]]:
+        ...
+```
+
+입출력 계약은 다음과 같습니다.
+
+| 구분 | 스펙 |
+| --- | --- |
+| 입력 `city` | `normalize_city_name()`을 통과한 비어 있지 않은 지역 검색어 |
+| 입력 `size` | 반환할 최대 장소 수, 기본값 5. 어댑터는 해당 API의 허용 범위를 검사할 수 있음 |
+| 정상 출력 | 공통 장소 객체의 목록. 결과가 없으면 빈 목록 `[]` |
+| 공통 장소 필드 | `name: str`, `address: str`, `category: str \| None`, `url: str \| None`, `x: float \| None`, `y: float \| None` |
+| 실패 출력 | 인증·쿼터·네트워크·응답 파싱 실패는 예외로 전달하며, 상위 반복문이 해당 도시의 오류를 기록하고 다음 도시를 계속 처리 |
+
+현재 `KakaoRestaurantSearchProvider`가 Kakao 전용 응답을 위 공통 장소 구조로
+바꾸는 어댑터입니다. 플러그인 선택은 `PLACE_SEARCH_PROVIDER` 값으로 하며,
+`create_place_search_provider()`가 레지스트리에서 팩토리를 찾아 인스턴스를
+생성합니다.
+
+### 새 지도 API 등록 방법
+
+다른 지도 API로 교체할 때는 공통 인터페이스를 구현하고 팩토리를 한 번 등록합니다.
+
+```python
+class AnotherMapProvider:
+    provider_name = "another-map"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def search_restaurants(self, city: str, *, size: int = 5):
+        documents = call_another_map_api(city=city, size=size)
+        return [
+            {
+                "name": item["title"],
+                "address": item.get("road_address", ""),
+                "category": item.get("category"),
+                "url": item.get("url"),
+                "x": item.get("longitude"),
+                "y": item.get("latitude"),
+            }
+            for item in documents
+        ]
+
+
+register_place_search_provider(
+    "another-map",
+    lambda settings: AnotherMapProvider(os.environ["ANOTHER_MAP_API_KEY"]),
+)
+```
+
+등록 코드를 애플리케이션 시작 시 한 번 import한 뒤
+`PLACE_SEARCH_PROVIDER=another-map`으로 설정하면 됩니다. 교체 시 변경 지점은
+새 어댑터 구현, 제공자별 키 로딩, 레지스트리 등록 세 곳이며, 지역 반복 처리,
+캐시, 리포트 생성과 `run()`의 검색 호출 코드는 변경하지 않습니다.
+
+## 도시명 정규화 파이프라인
+
+LLM이 `부산광역시 해운대구`, `제주특별자치도 제주시`처럼 서로 다른 수준의
+행정구역을 반환해도 검색어가 일관되도록 `normalize_city_name()`에서 다음
+파이프라인을 적용합니다.
+
+1. `NFKC` 유니코드 정규화로 전각 문자 등 표현 차이를 통일합니다.
+2. 앞뒤·중복 공백을 제거하고 `/`, `,`, 괄호 등의 구분자를 공백으로 바꿉니다.
+3. 광역 행정구역은 `STANDARD_CITY_NAMES` 표준 명칭으로 매핑합니다.
+4. 각 토큰에서 `특별시`, `광역시`, `특별자치도`, `시`, `군`, `구`, `읍`,
+   `면`, `동` 등의 행정 접미사를 제거해 핵심 명사를 추출합니다. 단, 제거 후
+   한 글자만 남는 `중구`, `우동` 같은 짧은 고유명은 원문을 유지합니다.
+5. `제주 제주`처럼 중복된 토큰을 입력 순서대로 제거합니다.
+6. 지나치게 긴 검색어를 막기 위해 광역명부터 세부 지역까지 핵심 토큰을 최대
+   3개만 유지합니다.
+
+주요 표준 명칭 매핑은 다음과 같습니다.
+
+| 입력 명칭 | 표준 명칭 | 입력 명칭 | 표준 명칭 |
+| --- | --- | --- | --- |
+| `서울특별시` | `서울` | `부산광역시` | `부산` |
+| `세종특별자치시` | `세종` | `강원특별자치도` | `강원` |
+| `전북특별자치도` | `전북` | `제주특별자치도` | `제주` |
+| `경상북도` | `경북` | `경상남도` | `경남` |
+| `충청북도` | `충북` | `충청남도` | `충남` |
+
+정규화 예시는 다음과 같습니다.
+
+| 원본 지명 | 검색용 표준 지명 |
+| --- | --- |
+| `부산광역시 / 해운대구 (우동)` | `부산 해운대 우동` |
+| `강원특별자치도 강릉시` | `강원 강릉` |
+| `제주특별자치도 제주시 애월읍 한림면` | `제주 애월 한림` |
+
+추천 JSON 검증 단계에서도 정규화 후 도시명을 사용하므로 `제주특별자치도`와
+`제주도`처럼 표현만 다른 중복 추천을 탐지할 수 있습니다. 각 지도 어댑터도
+검색 직전에 같은 함수를 적용해 직접 호출 시의 비정규화 입력을 방어합니다.
 
 ## 실행
 

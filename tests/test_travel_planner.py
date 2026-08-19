@@ -64,6 +64,37 @@ class DateValidationTests(unittest.TestCase):
         self.assertTrue(args.refresh)
 
 
+class CityNormalizationTests(unittest.TestCase):
+    def test_maps_standard_names_and_removes_administrative_suffixes(self):
+        self.assertEqual(
+            travel_planner.normalize_city_name(
+                "  부산광역시 / 해운대구 (우동)  "
+            ),
+            "부산 해운대 우동",
+        )
+        self.assertEqual(
+            travel_planner.normalize_city_name("강원특별자치도 강릉시"),
+            "강원 강릉",
+        )
+
+    def test_deduplicates_tokens_and_keeps_at_most_three_keywords(self):
+        self.assertEqual(
+            travel_planner.normalize_city_name("제주특별자치도 제주시 애월읍 한림면"),
+            "제주 애월 한림",
+        )
+
+    def test_recommendation_detects_duplicates_after_normalization(self):
+        with self.assertRaises(ValueError):
+            travel_planner.validate_recommendation_payload(
+                {
+                    "recommended_cities": [
+                        make_city("제주특별자치도"),
+                        make_city("제주도"),
+                    ]
+                }
+            )
+
+
 class RecommendationValidationTests(unittest.TestCase):
     def test_accepts_two_or_three_recommendations(self):
         payload = {
@@ -176,7 +207,9 @@ class KakaoMappingTests(unittest.TestCase):
         previous = sys.modules.get("requests")
         sys.modules["requests"] = fake_requests
         try:
-            result = travel_planner.search_kakao_restaurants("제주", "secret-key")
+            result = travel_planner.search_kakao_restaurants(
+                "부산광역시 해운대구", "secret-key"
+            )
         finally:
             if previous is None:
                 sys.modules.pop("requests", None)
@@ -186,9 +219,48 @@ class KakaoMappingTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(captured["url"], travel_planner.KAKAO_KEYWORD_SEARCH_URL)
         self.assertEqual(captured["headers"]["Authorization"], "KakaoAK secret-key")
-        self.assertEqual(captured["params"]["query"], "제주 맛집")
+        self.assertEqual(captured["params"]["query"], "부산 해운대 맛집")
         self.assertEqual(captured["params"]["category_group_code"], "FD6")
         self.assertEqual(captured["params"]["size"], 5)
+
+    def test_search_rejects_size_outside_kakao_range(self):
+        with self.assertRaises(ValueError):
+            travel_planner.search_kakao_restaurants("제주", "secret-key", size=16)
+
+
+class PlaceSearchPluginTests(unittest.TestCase):
+    def test_creates_registered_provider_through_common_interface(self):
+        provider_name = "test-map"
+
+        class TestProvider:
+            provider_name = "test-map"
+
+            def search_restaurants(self, city, *, size=5):
+                return [{"name": city, "address": "", "url": None}][:size]
+
+        travel_planner.register_place_search_provider(
+            provider_name, lambda settings: TestProvider()
+        )
+        try:
+            settings = travel_planner.Settings(
+                "openai-secret", "", "model", provider_name
+            )
+            provider = travel_planner.create_place_search_provider(settings)
+
+            result = provider.search_restaurants("강릉", size=1)
+        finally:
+            travel_planner.PLACE_SEARCH_PROVIDER_FACTORIES.pop(provider_name, None)
+
+        self.assertEqual(provider.provider_name, provider_name)
+        self.assertEqual(result[0]["name"], "강릉")
+
+    def test_rejects_unregistered_provider(self):
+        settings = travel_planner.Settings(
+            "openai-secret", "", "model", "missing-map"
+        )
+
+        with self.assertRaises(travel_planner.ConfigurationError):
+            travel_planner.create_place_search_provider(settings)
 
 
 class FallbackReportTests(unittest.TestCase):
@@ -318,7 +390,7 @@ class RunTests(unittest.TestCase):
             ]
         }
 
-        def fake_search(city, api_key):
+        def fake_search(city, api_key, *, size=5):
             return [
                 {
                     "name": f"{city} 식당",
@@ -368,9 +440,9 @@ class RunTests(unittest.TestCase):
             self.assertEqual(
                 search_mock.call_args_list,
                 [
-                    call("강릉", "kakao-secret"),
-                    call("경주", "kakao-secret"),
-                    call("제주", "kakao-secret"),
+                    call("강릉", "kakao-secret", size=5),
+                    call("경주", "kakao-secret", size=5),
+                    call("제주", "kakao-secret", size=5),
                 ],
             )
             self.assertEqual(payload["schema_version"], 2)
