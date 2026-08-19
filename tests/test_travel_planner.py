@@ -5,9 +5,41 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import travel_planner
+
+
+def make_city(city: str) -> dict:
+    return {
+        "city": city,
+        "weather": "선선한 날씨가 예상되는 시기입니다.",
+        "events": ["지역 행사 후보"],
+        "reason": "여행하기 좋은 시기입니다. 야외 활동에 적합합니다.",
+    }
+
+
+def make_cached_data(travel_date: str = "2026-09-15") -> dict:
+    recommendations = []
+    for city in ("강릉", "경주"):
+        recommendation = make_city(city)
+        recommendation["restaurants"] = [
+            {
+                "name": f"{city} 식당",
+                "address": f"{city} 중앙로 1",
+                "category": "음식점 > 한식",
+                "url": "https://place.map.kakao.com/1",
+                "x": 127.0,
+                "y": 37.0,
+            }
+        ]
+        recommendations.append(recommendation)
+    return {
+        "schema_version": travel_planner.CACHE_SCHEMA_VERSION,
+        "requested_date": travel_date,
+        "recommendations": recommendations,
+        "errors": [],
+    }
 
 
 class DateValidationTests(unittest.TestCase):
@@ -24,48 +56,51 @@ class DateValidationTests(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             travel_planner.parse_travel_date("2026-02-30")
 
+    def test_parser_accepts_refresh_option(self):
+        args = travel_planner.build_parser().parse_args(
+            ["--date", "2026-09-15", "--refresh"]
+        )
+
+        self.assertTrue(args.refresh)
+
 
 class RecommendationValidationTests(unittest.TestCase):
-    def test_accepts_required_recommendation_shape(self):
+    def test_accepts_two_or_three_recommendations(self):
         payload = {
-            "recommended_city": " 제주 ",
-            "weather": " 선선한 날씨 ",
-            "events": [" 지역 행사 후보 "],
-            "reason": "여행하기 좋은 시기입니다. 야외 활동에 적합합니다.",
+            "recommended_cities": [make_city(" 강릉 "), make_city("경주")]
         }
 
         result = travel_planner.validate_recommendation_payload(payload)
 
-        self.assertEqual(result["recommended_city"], "제주")
-        self.assertEqual(result["events"], ["지역 행사 후보"])
+        self.assertEqual(len(result["recommended_cities"]), 2)
+        self.assertEqual(result["recommended_cities"][0]["city"], "강릉")
+        self.assertEqual(
+            result["recommended_cities"][0]["events"], ["지역 행사 후보"]
+        )
 
-    def test_rejects_missing_required_key(self):
+    def test_rejects_only_one_recommendation(self):
         with self.assertRaises(ValueError):
             travel_planner.validate_recommendation_payload(
-                {
-                    "recommended_city": "제주",
-                    "weather": "선선함",
-                    "events": ["행사"],
-                }
+                {"recommended_cities": [make_city("제주")]}
+            )
+
+    def test_rejects_duplicate_cities(self):
+        with self.assertRaises(ValueError):
+            travel_planner.validate_recommendation_payload(
+                {"recommended_cities": [make_city("제주"), make_city("제주")]}
             )
 
     def test_rejects_too_many_events(self):
+        city = make_city("제주")
+        city["events"] = ["1", "2", "3", "4"]
         with self.assertRaises(ValueError):
             travel_planner.validate_recommendation_payload(
-                {
-                    "recommended_city": "제주",
-                    "weather": "선선함",
-                    "events": ["1", "2", "3", "4"],
-                    "reason": "추천 이유",
-                }
+                {"recommended_cities": [city, make_city("경주")]}
             )
 
     def test_retries_invalid_json_once(self):
         valid_payload = {
-            "recommended_city": "제주",
-            "weather": "선선함",
-            "events": ["지역 행사 후보"],
-            "reason": "여행하기 좋은 시기입니다. 야외 활동에 적합합니다.",
+            "recommended_cities": [make_city("제주"), make_city("경주")]
         }
 
         class FakeResponses:
@@ -84,10 +119,13 @@ class RecommendationValidationTests(unittest.TestCase):
             client, "test-model", "2026-09-15"
         )
 
-        self.assertEqual(result["recommended_city"], "제주")
+        self.assertEqual(len(result["recommended_cities"]), 2)
         self.assertEqual(len(responses.calls), 2)
+        output_format = responses.calls[0]["text"]["format"]
+        self.assertEqual(output_format["type"], "json_schema")
         self.assertEqual(
-            responses.calls[0]["text"]["format"]["type"], "json_schema"
+            output_format["schema"]["properties"]["recommended_cities"]["minItems"],
+            2,
         )
 
 
@@ -154,28 +192,109 @@ class KakaoMappingTests(unittest.TestCase):
 
 
 class FallbackReportTests(unittest.TestCase):
-    def test_fallback_report_contains_all_required_sections(self):
-        data = {
-            "requested_date": "2026-09-15",
-            "recommendation": {
-                "recommended_city": "제주",
-                "weather": "선선함",
-                "events": ["지역 행사 후보"],
-                "reason": "여행하기 좋은 시기입니다.",
-            },
-            "restaurants": [],
-            "errors": [],
-        }
+    def test_fallback_report_organizes_results_by_city(self):
+        data = make_cached_data()
+        data["recommendations"][1]["restaurants"] = []
 
         report = travel_planner.build_fallback_report(data)
 
+        self.assertIn("### 1. 강릉", report)
+        self.assertIn("### 2. 경주", report)
         self.assertIn("데이터 없음", report)
+        self.assertEqual(report.count("#### 맛집 추천"), 2)
         for heading in travel_planner.REQUIRED_REPORT_HEADINGS:
             self.assertIn(heading, report)
 
-    def test_report_validation_rejects_missing_sections(self):
+    def test_report_validation_rejects_incomplete_city_sections(self):
+        report = travel_planner.build_fallback_report(make_cached_data())
+
         with self.assertRaises(travel_planner.ReportFormatError):
-            travel_planner.validate_report("# 제목\n\n## 추천 지역\n\n제주")
+            travel_planner.validate_report(report, ["강릉", "경주", "제주"])
+
+    def test_report_validation_rejects_missing_city_name(self):
+        report = travel_planner.build_fallback_report(make_cached_data())
+
+        with self.assertRaises(travel_planner.ReportFormatError):
+            travel_planner.validate_report(report, ["강릉", "부산"])
+
+
+class CacheTests(unittest.TestCase):
+    def test_validates_current_cache_and_rejects_legacy_shape(self):
+        result = travel_planner.validate_cached_travel_data(
+            make_cached_data(), "2026-09-15"
+        )
+
+        self.assertEqual(len(result["recommendations"]), 2)
+        with self.assertRaises(travel_planner.CacheFormatError):
+            travel_planner.validate_cached_travel_data(
+                {
+                    "requested_date": "2026-09-15",
+                    "recommendation": {"recommended_city": "제주"},
+                },
+                "2026-09-15",
+            )
+
+    def test_cache_hit_reuses_report_without_loading_keys_or_calling_apis(self):
+        data = make_cached_data()
+        report = travel_planner.build_fallback_report(data)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_dir = Path(temp_dir)
+            json_path = result_dir / "2026-09-15_travel_data.json"
+            report_path = result_dir / "2026-09-15_travel_plan.md"
+            json_path.write_text(json.dumps(data), encoding="utf-8")
+            report_path.write_text(report, encoding="utf-8")
+
+            with (
+                patch.object(travel_planner, "RESULTS_DIR", result_dir),
+                patch.object(
+                    travel_planner,
+                    "load_settings",
+                    side_effect=AssertionError("API 키를 읽으면 안 됩니다."),
+                ),
+                patch.object(
+                    travel_planner,
+                    "create_openai_client",
+                    side_effect=AssertionError("OpenAI를 호출하면 안 됩니다."),
+                ),
+                patch.object(
+                    travel_planner,
+                    "search_kakao_restaurants",
+                    side_effect=AssertionError("Kakao를 호출하면 안 됩니다."),
+                ),
+            ):
+                exit_code = travel_planner.run("2026-09-15")
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(report_path.read_text(encoding="utf-8"), report)
+
+    def test_cache_json_regenerates_missing_report_without_api_calls(self):
+        data = make_cached_data()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_dir = Path(temp_dir)
+            json_path = result_dir / "2026-09-15_travel_data.json"
+            report_path = result_dir / "2026-09-15_travel_plan.md"
+            json_path.write_text(json.dumps(data), encoding="utf-8")
+
+            with (
+                patch.object(travel_planner, "RESULTS_DIR", result_dir),
+                patch.object(
+                    travel_planner,
+                    "load_settings",
+                    side_effect=AssertionError("API 키를 읽으면 안 됩니다."),
+                ),
+                patch.object(
+                    travel_planner,
+                    "create_openai_client",
+                    side_effect=AssertionError("OpenAI를 호출하면 안 됩니다."),
+                ),
+            ):
+                exit_code = travel_planner.run("2026-09-15")
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(report_path.exists())
+            self.assertIn("### 1. 강릉", report_path.read_text(encoding="utf-8"))
 
 
 class SecurityTests(unittest.TestCase):
@@ -188,7 +307,79 @@ class SecurityTests(unittest.TestCase):
         self.assertIn("[REDACTED]", message)
 
 
-class RunFailureTests(unittest.TestCase):
+class RunTests(unittest.TestCase):
+    def test_success_searches_each_city_and_saves_grouped_json(self):
+        settings = travel_planner.Settings("openai-secret", "kakao-secret", "model")
+        recommendation = {
+            "recommended_cities": [
+                make_city("강릉"),
+                make_city("경주"),
+                make_city("제주"),
+            ]
+        }
+
+        def fake_search(city, api_key):
+            return [
+                {
+                    "name": f"{city} 식당",
+                    "address": f"{city} 중앙로",
+                    "category": None,
+                    "url": None,
+                    "x": None,
+                    "y": None,
+                }
+            ]
+
+        def fake_report(client, model, travel_data):
+            return travel_planner.build_fallback_report(travel_data)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_dir = Path(temp_dir)
+            with (
+                patch.object(travel_planner, "RESULTS_DIR", result_dir),
+                patch.object(travel_planner, "create_openai_client", return_value=object()),
+                patch.object(
+                    travel_planner,
+                    "generate_recommendation",
+                    return_value=recommendation,
+                ),
+                patch.object(
+                    travel_planner,
+                    "search_kakao_restaurants",
+                    side_effect=fake_search,
+                ) as search_mock,
+                patch.object(
+                    travel_planner,
+                    "generate_final_report",
+                    side_effect=fake_report,
+                ),
+            ):
+                exit_code = travel_planner.run(
+                    "2026-09-15", settings, refresh=True
+                )
+
+            payload = json.loads(
+                (result_dir / "2026-09-15_travel_data.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                search_mock.call_args_list,
+                [
+                    call("강릉", "kakao-secret"),
+                    call("경주", "kakao-secret"),
+                    call("제주", "kakao-secret"),
+                ],
+            )
+            self.assertEqual(payload["schema_version"], 2)
+            self.assertEqual(len(payload["recommendations"]), 3)
+            self.assertEqual(
+                payload["recommendations"][1]["restaurants"][0]["name"],
+                "경주 식당",
+            )
+
     def test_first_llm_failure_still_saves_json_and_markdown(self):
         settings = travel_planner.Settings("openai-secret", "kakao-secret", "model")
 
@@ -202,7 +393,9 @@ class RunFailureTests(unittest.TestCase):
                     side_effect=RuntimeError("failed with openai-secret"),
                 ),
             ):
-                exit_code = travel_planner.run("2026-09-15", settings)
+                exit_code = travel_planner.run(
+                    "2026-09-15", settings, refresh=True
+                )
 
             json_path = Path(temp_dir) / "2026-09-15_travel_data.json"
             report_path = Path(temp_dir) / "2026-09-15_travel_plan.md"
